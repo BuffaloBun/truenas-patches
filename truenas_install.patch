@@ -1,0 +1,124 @@
+diff --git a/mnt/truenas_install/__main__.py b/mnt/truenas_install/__main__.py
+index bf313f2..e5ccdd6 100644
+--- a/mnt/truenas_install/__main__.py
++++ b/mnt/truenas_install/__main__.py
+@@ -6,10 +6,12 @@ import itertools
+ import json
+ import logging
+ import os
++import pathlib
+ import platform
+ import re
+ import shutil
+ import sqlite3
++import stat
+ import subprocess
+ import sys
+ import tempfile
+@@ -639,8 +641,22 @@ def main():
+                     run_command(["mount", "-t", "sysfs", "none", f"{root}/sys"])
+                     undo.append(["umount", f"{root}/sys"])
+ 
+-                    run_command(["mount", "-t", "zfs", f"{pool_name}/grub", f"{root}/boot/grub"])
+-                    undo.append(["umount", f"{root}/boot/grub"])
++                    keystore = run_command([
++                        "zfs", "get", "-H", "-o", "value", "org.zfsbootmenu:keysource", pool_name
++                    ]).stdout.strip()
++                    keystore_mnt = run_command([
++                        "zfs", "get", "-H", "-o", "value", "mountpoint", keystore
++                    ]).stdout.strip()
++                    run_command(["chroot", root, "zfs", "mount", keystore])
++                    undo.append(["chroot", root, "zfs", "unmount", keystore])
++                    zol_conf = pathlib.Path(f"{root}/usr/share/initramfs-tools/hooks/keystore")
++                    zol_conf.write_text(f"""#!/bin/sh
++mkdir -p "${{DESTDIR}}/{keystore_mnt}"
++cp {keystore_mnt}/{pool_name}.key "${{DESTDIR}}/{keystore_mnt}/{pool_name}.key"
++exit 0
++""")
++                    zol_conf.chmod(zol_conf.stat().st_mode | stat.S_IEXEC)
++                    run_command(["chmod", "+x", zol_conf.__str__()])
+ 
+                     # It will legitimately exit with code 2 if initramfs must be updated (which we'll do anyway)
+                     write_progress(0.55, "Running autotune")
+@@ -679,8 +695,6 @@ def main():
+                     run_command(["chroot", root, "/usr/local/bin/truenas-grub.py"])
+                     write_progress(0.8, "Updating initramfs")
+                     run_command(["chroot", root, "update-initramfs", "-k", "all", "-u"])
+-                    write_progress(0.9, "Updating GRUB")
+-                    run_command(["chroot", root, "update-grub"])
+ 
+                     # We would like to configure fips bit as well here
+                     write_progress(0.95, "Configuring FIPS")
+@@ -702,9 +716,9 @@ def main():
+ 
+                         os.makedirs(f"{root}/boot/efi", exist_ok=True)
+                         for i, disk in enumerate(disks):
+-                            install_grub_i386 = True
++                            install_grub_i386 = False
+                             efi_partition_number = 2
+-                            format_efi_partition = True
++                            format_efi_partition = False
+                             copy_bsd_loader = False
+                             if is_freebsd_loader_upgrade:
+                                 first_partition_guid = get_partition_guid(disk, 1)
+@@ -712,7 +726,7 @@ def main():
+                                     install_grub_i386 = False
+                                     efi_partition_number = 1
+                                     format_efi_partition = False
+-                                    copy_bsd_loader = True
++                                    copy_bsd_loader = False
+                                 if first_partition_guid == FREEBSD_BOOT_PARTITION_GUID:
+                                     run_command([
+                                         "sgdisk", "-t1:EF02", f"/dev/{disk}",
+@@ -737,24 +751,17 @@ def main():
+                                     shutil.copyfile(root + CORE_BSD_LOADER_PATH, root + SCALE_BSD_LOADER_PATH)
+ 
+                             try:
+-                                grub_cmd = ["chroot", root, "grub-install", "--target=x86_64-efi",
+-                                            "--efi-directory=/boot/efi",
+-                                            "--bootloader-id=debian",
+-                                            "--recheck",
+-                                            "--no-floppy",
+-                                            "--no-nvram"]
+-                                run_command(grub_cmd)
+-
+-                                run_command(["chroot", root, "mkdir", "-p", "/boot/efi/EFI/boot"])
+-                                run_command(["chroot", root, "cp", "/boot/efi/EFI/debian/grubx64.efi",
+-                                             "/boot/efi/EFI/boot/bootx64.efi"])
+-
+                                 if os.path.exists("/sys/firmware/efi"):
+                                     run_command(["chroot", root, "efibootmgr", "-c",
+                                                  "-d", f"/dev/{disk}",
+                                                  "-p", f"{efi_partition_number}",
+-                                                 "-L", f"TrueNAS-{i}",
+-                                                 "-l", "/EFI/debian/grubx64.efi"])
++                                                 "-L", f"ZFSBootMenu (Backup)",
++                                                 "-l", "\EFI\ZBM\VMLINUZ-BACKUP.EFI"])
++                                    run_command(["chroot", root, "efibootmgr", "-c",
++                                                 "-d", f"/dev/{disk}",
++                                                 "-p", f"{efi_partition_number}",
++                                                 "-L", f"ZFSBootMenu",
++                                                 "-l", "\EFI\ZBM\VMLINUZ.EFI"])
+                             finally:
+                                 run_command(["chroot", root, "umount", "/boot/efi"])
+             finally:
+@@ -776,7 +783,6 @@ def main():
+                     run_command(["zfs", "snapshot", f"{this_ds}@pristine"])
+ 
+             run_command(["zfs", "set", f"mountpoint={mp}", this_ds])
+-            run_command(["zfs", "set", 'org.zectl:bootloader=""', this_ds])
+ 
+         run_command(["zfs", "set", "readonly=on", dataset_name])
+         run_command(["zfs", "snapshot", f"{dataset_name}@pristine"])
+@@ -788,8 +794,8 @@ def main():
+             run_command(["zfs", "destroy", "-r", dataset_name])
+         raise
+ 
+-    configure_system_for_zectl(pool_name)
+-
++    run_command(["zfs", "set", "mountpoint=/", dataset_name])
++    run_command(["zfs", "set", "canmount=noauto", dataset_name])
+ 
+ if __name__ == "__main__":
+     main()
+\ No newline at end of file

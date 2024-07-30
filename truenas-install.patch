@@ -1,0 +1,128 @@
+diff --git a/usr/sbin/truenas-install b/usr/sbin/truenas-install
+index 6984c08..48a9ab4 100755
+--- a/usr/sbin/truenas-install
++++ b/usr/sbin/truenas-install
+@@ -448,6 +448,13 @@ create_partitions()
+ 	_parts="${_parts} 2"
+     fi
+ 
++    # Download ZBM EFI
++    mkdir -p /tmp/efi
++    mount $(get_partition ${_disk} 2) /tmp/efi
++    curl --create-dirs -o /tmp/efi/EFI/ZBM/VMLINUZ.EFI -L https://get.zfsbootmenu.org/efi
++    cp /tmp/efi/EFI/ZBM/VMLINUZ.EFI /tmp/efi/EFI/ZBM/VMLINUZ-BACKUP.EFI
++    umount /tmp/efi
++
+     if is_swap_safe; then
+ 	if ! sgdisk -n4:0:+16777216K -t4:8200 /dev/${_disk}; then
+ 	    return 1
+@@ -458,12 +465,19 @@ create_partitions()
+     fi
+ 
+     # Create boot pool
+-    if ! sgdisk -n3:0:0 -t3:BF01 /dev/${_disk}; then
++    if ! sgdisk -n3:0:+64G -t3:BF01 /dev/${_disk}; then
+ 	    return 1
+     else
+ 	_parts="${_parts} 3"
+     fi
+ 
++    # Create apps pool
++    if ! sgdisk -n5:0:0 -t5:BF01 /dev/${_disk}; then
++	    return 1
++    else
++	_parts="${_parts} 5"
++    fi
++
+     # Bad hardware is bad but we've seen a few users
+     # state that by the time we run `parted` command
+     # down below OR the caller of this function tries
+@@ -525,11 +539,14 @@ partition_disks()
+     local _disk _disks _disksparts
+     local _mirror
+     local _minsize
++    local _password
+ 
+     # Create and destroy existing pool (if exists)
+     zpool import -N -f ${BOOT_POOL} 2> /dev/null || true
+     zpool destroy -f ${BOOT_POOL} 2> /dev/null || true
+ 
++    _password=$1
++    shift
+     _disks=$*
+ 
+     # Erase both typical metadata area.
+@@ -549,6 +566,9 @@ partition_disks()
+     _disksparts=$(for _disk in ${_disks}; do
+ 	echo $(get_partition ${_disk} 3)
+     done)
++    _disksparts_app=$(for _disk in ${_disks}; do
++	echo $(get_partition ${_disk} 5)
++    done)
+ 
+     if [ $# -gt 1 ]; then
+ 	_mirror="mirror"
+@@ -558,15 +578,41 @@ partition_disks()
+ 
+     # Regardless of upgrade/fresh installation, if we are creating a new pool, it's going to be named after value of NEW_BOOT_POOL
+     BOOT_POOL=${NEW_BOOT_POOL}
++    APP_POOL="app-pool"
++
++    KEYSTORE="/etc/keystore"
++    mkdir -p "$KEYSTORE"
++    echo "$_password" > "$KEYSTORE/$BOOT_POOL.key"
++    echo "$_password" > "$KEYSTORE/$APP_POOL.key"
++
+     zpool create -f -o cachefile=/tmp/zpool.cache -o ashift=12 \
+-		-o compatibility=grub2 \
+ 		-O acltype=off -O canmount=off -O compression=lz4 -O devices=off -O mountpoint=none \
+ 		-O normalization=formD -O relatime=on -O xattr=sa \
++        -O encryption=on -O keylocation=file://"$KEYSTORE/$BOOT_POOL.key" -O keyformat=passphrase \
+ 		${BOOT_POOL} ${_mirror} ${_disksparts}
+     zfs set compression=on ${BOOT_POOL}
++    zfs set org.zfsbootmenu:keysource=${BOOT_POOL}/keystore ${BOOT_POOL}
++    zfs set org.zfsbootmenu:commandline="quiet splash nomodeset libata.allow_tpm=1" ${BOOT_POOL}
+     zfs create -o canmount=off ${BOOT_POOL}/ROOT
+     zfs create -o canmount=off -o mountpoint=legacy ${BOOT_POOL}/grub
+ 
++    cp "$KEYSTORE/$BOOT_POOL.key" "/tmp/$BOOT_POOL.key"
++    cp "$KEYSTORE/$APP_POOL.key" "/tmp/$APP_POOL.key"
++    zfs create -o mountpoint=$KEYSTORE ${BOOT_POOL}/keystore
++    cp "/tmp/$BOOT_POOL.key" "$KEYSTORE/$BOOT_POOL.key"
++    cp "/tmp/$APP_POOL.key" "$KEYSTORE/$APP_POOL.key"
++    chmod 000 "$KEYSTORE/$BOOT_POOL.key"
++    chmod 000 "$KEYSTORE/$APP_POOL.key"
++
++    zpool create -f -o cachefile=/tmp/zpool.cache -o ashift=12 \
++		-O aclinherit=passthrough -O aclmode=discard -O acltype=posix \
++        -O atime=off -O compression=lz4 -O mountpoint=${APP_POOL} \
++		-O encryption=on -O keylocation=file://"$KEYSTORE/$APP_POOL.key" -O keyformat=passphrase \
++		${APP_POOL} ${_mirror} ${_disksparts_app}
++    zfs set org.zfsbootmenu:keysource=${BOOT_POOL}/keystore ${APP_POOL}
++    zpool set autotrim=on ${APP_POOL}
++    zfs umount "${BOOT_POOL}/keystore"
++
+     return 0
+ }
+ 
+@@ -919,14 +965,18 @@ menu_install()
+ 	# We repartition on fresh install, or old upgrade_style
+ 	# This destroys all of the pool data, and
+ 	# ensures a clean filesystems.
+-	partition_disks ${_realdisks}
++	partition_disks $(echo ${authentication_method} | jq -r ".password") ${_realdisks}
+     fi
+ 
+     local OS=TrueNAS
+ 
+     # Mount update image
+     umount /mnt || true
+-    mount /cdrom/TrueNAS-SCALE.update /mnt -t squashfs -o loop
++    mkdir -p /tmp/cd /tmp/overlay/upper/mnt /tmp/overlay/work/mnt
++    mount /cdrom/TrueNAS-SCALE.update /tmp/cd -t squashfs -o loop
++    mount -t overlay -o lowerdir=/tmp/cd,upperdir=/tmp/overlay/upper/mnt,workdir=/tmp/overlay/work/mnt overlay /mnt
++
++    git apply --ignore-whitespace --directory=/ --unsafe-paths /tmp/truenas-patches/truenas_install.patch
+ 
+     space_required=$(cat /mnt/manifest.json | jq ".size")
+     free_space=$(zpool get -H -o value -p free "$BOOT_POOL")
